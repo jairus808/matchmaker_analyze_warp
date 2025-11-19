@@ -61,6 +61,8 @@ def main():
     with open(ROOT_DIR / "results" / "simple_example.json", "w") as f:
         json.dump(results, f, indent=4)
 
+    
+
     print(f"Evaluation Result: {json.dumps(results, indent=4)}")
     print(f"Detailed evaluation results saved in {ROOT_DIR / 'results'}")
 

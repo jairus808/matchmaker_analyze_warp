@@ -274,26 +274,78 @@ class Matchmaker(object):
         return beat_position
 
     def build_score_annotations(self, level="beat", musical_beat: bool = False):
-        score_annots = []
-        if level == "beat":  # TODO: add bar-level, note-level
-            if musical_beat:
-                self.score_part.use_musical_beat()  # for asap dataset
-            note_array = np.unique(self.score_part.note_array()["onset_beat"])
-            start_beat = np.ceil(note_array.min())
-            end_beat = np.floor(note_array.max())
-            self.beats = np.arange(start_beat, end_beat + 1)
+        def beats_to_seconds(beats: np.ndarray) -> np.ndarray:
+            beats = np.asarray(beats, dtype=np.float64)
+            if beats.size == 0:
+                return np.asarray([], dtype=np.float64)
 
-            beat_timestamp = [
-                self.score_part.inv_beat_map(beat)
-                / self.score_part.quarter_duration_map(
-                    self.score_part.inv_beat_map(beat)
+            beat_times = np.fromiter(
+                (self.score_part.inv_beat_map(float(beat)) for beat in beats),
+                dtype=np.float64,
+                count=beats.size,
+            )
+            quarter_durations = np.fromiter(
+                (self.score_part.quarter_duration_map(time) for time in beat_times),
+                dtype=np.float64,
+                count=beat_times.size,
+            )
+            return beat_times / quarter_durations * (60 / self.tempo)
+
+        if level not in {"beat", "bar", "note"}:
+            raise ValueError(f"Unsupported annotation level: {level}")
+
+        if musical_beat:
+            self.score_part.use_musical_beat()
+
+        note_array = self.score_part.note_array()
+        if note_array.size == 0:
+            self.beats = np.asarray([], dtype=np.float64)
+            return beats_to_seconds(self.beats)
+
+        onset_beats = np.asarray(note_array["onset_beat"], dtype=np.float64)
+
+        if level == "beat":
+            unique_beats = np.unique(onset_beats)
+            if unique_beats.size == 0:
+                self.beats = np.asarray([], dtype=np.float64)
+                return beats_to_seconds(self.beats)
+
+            start_beat = np.ceil(unique_beats.min())
+            end_beat = np.floor(unique_beats.max())
+            if start_beat > end_beat:
+                self.beats = np.asarray([], dtype=np.float64)
+            else:
+                self.beats = np.arange(start_beat, end_beat + 1, dtype=np.float64)
+            return beats_to_seconds(self.beats)
+
+        if level == "bar":
+            measure_field = next(
+                (
+                    field
+                    for field in ("measure", "measure_idx", "measure_index")
+                    if field in note_array.dtype.names
+                ),
+                None,
+            )
+            if measure_field is None:
+                raise ValueError("Measure information not available in score.")
+
+            measures = np.asarray(note_array[measure_field])
+            order = np.lexsort((onset_beats, measures))
+            sorted_measures = measures[order]
+            sorted_onsets = onset_beats[order]
+            if sorted_measures.size == 0:
+                self.beats = np.asarray([], dtype=np.float64)
+            else:
+                first_mask = np.concatenate(
+                    ([True], sorted_measures[1:] != sorted_measures[:-1])
                 )
-                * (60 / self.tempo)
-                for beat in self.beats
-            ]
+                self.beats = sorted_onsets[first_mask]
+            return beats_to_seconds(self.beats)
 
-            score_annots = np.array(beat_timestamp)
-        return score_annots
+        order = np.argsort(onset_beats, kind="mergesort")
+        self.beats = onset_beats[order]
+        return beats_to_seconds(self.beats)
 
     def convert_timestamps_to_beats(self, timestamps):
         """

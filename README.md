@@ -1,5 +1,13 @@
 # Analyze_warp
 
+As a part of my CPSC4900, I will build on top of the existing Matchmaker library, flushing 
+out all major components to implement an analysis layer that indicates and characterizes expressive timing events. Using a livetime comparison of ref_idx and perf_idx to deliver tempo_ratio, an indication of alignment performance features against expected performnace features encoded in the input score. 
+
+All work with this CPSC4900 will is done (for now) on analyze_warp.py. 
+
+## Future implementations:
+- Event characterization
+- Touchdesign compatbility
 
 
 

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -12,6 +13,8 @@ import pyaudio
 
 from matchmaker import Matchmaker
 from matchmaker.features.audio import SAMPLE_RATE
+#install python-osc
+from pythonosc.udp_client import SimpleUDPClient 
 
 
 os.environ["PARTITURA_SOUNDFONT"] = "tests/Steinway_B_soundfont.sf2"
@@ -23,25 +26,34 @@ DEFAULT_AUDIO_PERF = Path("matchmaker/assets/simple_performance.mp3")
 DEFAULT_ANNOTS = Path("matchmaker/assets/simple_perf_annotations.txt")
 DEFAULT_RESULTS_DIR = Path("results")
 
-FRAME_RATE = 60
 
+FRAME_RATE = 30 #fps, default used by matchmaker is 30, use 25 for simple_example.tsv if you 
 
+#make pandas datafram with computed slope for easy printout functionality
 def _add_temporal_columns(df: pd.DataFrame, frame_rate: int) -> pd.DataFrame:
     df["score_time"] = df["ref_idx"] / frame_rate
     df["perf_time"] = df["input_idx"] / frame_rate
 
 
-#append to NaN instead of 0 to prevent
+#append to NaN instead of 0 to prevent. tempo_ratio 
     dt_score = np.diff(df["score_time"].to_numpy(), prepend=np.nan)
     dt_perf = np.diff(df["perf_time"].to_numpy(), prepend=np.nan)
+    delta_ref = np.diff(df["ref_idx"].to_numpy(), prepend=np.nan)
+    delta_perf = np.diff(df["input_idx"].to_numpy(), prepend=np.nan)
 
-    tempo_ratio = np.divide(
-        dt_perf,
-        dt_score,
-        out=np.full_like(dt_perf, np.nan),
-        where=np.abs(dt_score) > 0,
-    )
-    df["tempo_ratio"] = tempo_ratio
+    delta_ratio = np.full_like(delta_perf, np.nan, dtype=np.float64)
+    valid = ~np.isnan(delta_ref) & (delta_ref != 0)
+    delta_ratio[valid] = delta_perf[valid] / delta_ref[valid]
+    leading = (~valid) & (delta_perf > 0)
+    delta_ratio[leading] = delta_perf[leading]
+
+    df["dt_score"] = dt_score
+    df["delta_ref"] = delta_ref
+    df["delta_perf"] = delta_perf
+    df["delta_ratio"] = delta_ratio
+    df["perf_leading"] = (np.abs(dt_score) == 0) & (dt_perf > 0)
+    # tempo_ratio mirrors delta_ratio only when the score advances; otherwise nan
+    df["tempo_ratio"] = np.where(np.abs(delta_ref) > 0, delta_ratio, np.nan)
     return df
 
 
@@ -52,8 +64,60 @@ def _format_ratio(ratio: float) -> str:
     return f"{ratio:.4f}"
 
 
+def _find_runs(mask: pd.Series) -> List[tuple[int, int, int]]:
+    """Return list of (start, end, length) for contiguous True spans."""
+    runs: List[tuple[int, int, int]] = []
+    start = None
+    for i, val in mask.reset_index(drop=True).items():
+        if val and start is None:
+            start = i
+        if (not val or i == len(mask) - 1) and start is not None:
+            end = i if val else i - 1
+            runs.append((start, end, end - start + 1))
+            start = None
+    return runs
+
+
+def summarize_runs(df: pd.DataFrame) -> None:
+    """Print quick summaries of contiguous perf-leading and jump events."""
+    lead_mask = (df["delta_ref"] == 0) & (df["delta_perf"] > 0)
+    jump_mask = df["delta_ref"] >= 5
+    lead_runs = _find_runs(lead_mask)
+    jump_runs = _find_runs(jump_mask)
+    max_lead = max((l for *_, l in lead_runs), default=0)
+    max_jump = max((l for *_, l in jump_runs), default=0)
+    print(
+        f"[summary] perf_leading runs: {len(lead_runs)} (max len={max_lead})",
+        flush=True,
+    )
+    print(
+        f"[summary] score_jump (delta_ref>=5) runs: {len(jump_runs)} (max len={max_jump})",
+        flush=True,
+    )
+    # emit run boundaries for downstream processing
+    if lead_runs:
+        print(
+            "[summary] perf_leading boundaries (start,end,len): "
+            + "; ".join(f"{s},{e},{l}" for s, e, l in lead_runs),
+            flush=True,
+        )
+    if jump_runs:
+        print(
+            "[summary] score_jump boundaries (start,end,len): "
+            + "; ".join(f"{s},{e},{l}" for s, e, l in jump_runs),
+            flush=True,
+        )
+
+
 # run matchmakers  ref vs. input
-def stream_from_file(tsv_path: Path, frame_rate: int) -> pd.DataFrame:
+def stream_from_file(
+    tsv_path: Path,
+    frame_rate: int,
+    playback: bool = False,
+    performance_path: Optional[Path] = None,
+    wait: bool = True,
+    osc: Optional["SimpleUDPClient"] = None,
+) -> pd.DataFrame:
     df = pd.read_csv(
         tsv_path,
         sep="\t",
@@ -61,15 +125,107 @@ def stream_from_file(tsv_path: Path, frame_rate: int) -> pd.DataFrame:
         names=["ref_idx", "input_idx"],
     )
     df = _add_temporal_columns(df, frame_rate)
+    print(
+        "[file] Loaded "
+        f"{len(df)} frames (max ref_idx={int(df['ref_idx'].max())}, "
+        f"max input_idx={int(df['input_idx'].max())})",
+        flush=True,
+    )
 
-    for idx, row in df.iterrows():
-        ratio_str = _format_ratio(row["tempo_ratio"])
-        print(
-            f"[file] Frame {idx:05d} | score_idx={int(row['ref_idx'])} | "
-            f"perf_idx={int(row['input_idx'])} | tempo_ratio={ratio_str}",
-            flush=True,
-        )
+    stop_event: Optional[threading.Event] = None
+    playback_thread: Optional[threading.Thread] = None
+    lead_run_start: Optional[int] = None
+    jump_run_start: Optional[int] = None
+    if playback:
+        if performance_path is None:
+            print("[file] Playback requested but no performance file provided.")
+        elif not performance_path.exists():
+            print(f"[file] Playback requested but file not found: {performance_path}")
+        else:
+            stop_event = threading.Event()
+            playback_thread = _start_playback(
+                performance_path=performance_path, stop_event=stop_event
+            )
 
+    try:
+        for idx, row in df.iterrows():
+            ratio_val = row["tempo_ratio"]
+            delta_ratio_val = row.get("delta_ratio", np.nan)
+            ratio_str = _format_ratio(ratio_val)
+            grad_str = _format_ratio(delta_ratio_val)
+            delta_ref_str = _format_ratio(row.get("delta_ref", np.nan))
+            delta_perf_str = _format_ratio(row.get("delta_perf", np.nan))
+            dt_score_str = _format_ratio(row["dt_score"])
+            print(
+                f"[file] Frame {idx:05d} | score_idx={int(row['ref_idx'])} | "
+                f"perf_idx={int(row['input_idx'])} | "
+                f"Δref={delta_ref_str} | Δperf={delta_perf_str} | "
+                f"t_r={ratio_str} | grad={grad_str} | dt_score={dt_score_str}",
+                flush=True,
+            )
+
+            if osc:
+                osc.send_message(
+                    "/warp",
+                    [
+                        int(row["ref_idx"]),
+                        int(row["input_idx"]),
+                        float(row.get("delta_ratio", np.nan)),
+                        float(row.get("tempo_ratio", np.nan)),
+                        float(row.get("dt_score", np.nan)),
+                        float(row.get("delta_ref", np.nan)),
+                        float(row.get("delta_perf", np.nan)),
+                        int(row.get("perf_leading", False)),
+                    ],
+                )
+
+            # event logging as soon as runs end. Had to take from a stack overflow discussion that I accessed from chatgpt (contiguous events on pandas ..
+            #.https://stackoverflow.com/questions/65238399/how-to-get-start-and-end-indices-of-consecutive-groups-of-data-in-pandas?utm_source=chatgpt.com)
+            lead_now = (row.get("delta_ref", np.nan) == 0) and (row.get("delta_perf", np.nan) > 0)
+            jump_now = row.get("delta_ref", 0) >= 5 if not np.isnan(row.get("delta_ref", np.nan)) else False
+            if lead_now and lead_run_start is None:
+                lead_run_start = idx
+            if not lead_now and lead_run_start is not None:
+                end = idx - 1
+                length = end - lead_run_start + 1
+                print(f"[event] perf_leading run start={lead_run_start} end={end} len={length}", flush=True)
+                if osc:
+                    osc.send_message("/event", ["perf_leading", lead_run_start, end, length])
+                lead_run_start = None
+
+            if jump_now and jump_run_start is None:
+                jump_run_start = idx
+            if not jump_now and jump_run_start is not None:
+                end = idx - 1
+                length = end - jump_run_start + 1
+                print(f"[event] score_jump run start={jump_run_start} end={end} len={length}", flush=True)
+                if osc:
+                    osc.send_message("/event", ["score_jump", jump_run_start, end, length])
+                jump_run_start = None
+
+            #wait boolean logic...
+            if wait and frame_rate > 0:
+                time.sleep(1 / frame_rate)
+    finally:
+        if playback_thread is not None:
+            # Let playback finish naturally; join so the audio completes.
+            playback_thread.join()
+
+    # flush any open runs
+    if lead_run_start is not None:
+        end = len(df) - 1
+        length = end - lead_run_start + 1
+        print(f"[event] perf_leading run start={lead_run_start} end={end} len={length}", flush=True)
+        if osc:
+            osc.send_message("/event", ["perf_leading", lead_run_start, end, length])
+    if jump_run_start is not None:
+        end = len(df) - 1
+        length = end - jump_run_start + 1
+        print(f"[event] score_jump run start={jump_run_start} end={end} len={length}", flush=True)
+        if osc:
+            osc.send_message("/event", ["score_jump", jump_run_start, end, length])
+
+    summarize_runs(df)
     return df
 
 
@@ -115,8 +271,17 @@ def _start_playback(performance_path: Path, stop_event: threading.Event) -> thre
     return thread
 
 
+def describe_tempo_events(df: pd.DataFrame) -> List[dict]:
+    # Placeholder: not currently used in the CLI flow.
+    # Returns an empty list to keep the module runnable until the logic is defined.
+    return []
 
-#another run-matchmaker helper, initializes state. 
+
+
+
+
+
+#the main matchmaker helper, initializes everything
 def stream_live_run(
     mm: Matchmaker,
     frame_rate: int,
@@ -126,6 +291,7 @@ def stream_live_run(
     results_dir: Path,
     verbose_run: bool,
     playback: bool,
+    osc: Optional["SimpleUDPClient"] = None,
 ) -> Tuple[pd.DataFrame, Optional[dict]]:
     rows: List[dict] = []
     prev_ref = None
@@ -133,63 +299,135 @@ def stream_live_run(
     playback_thread: Optional[threading.Thread] = None
     stop_event: Optional[threading.Event] = None
     playback_started = False
+    lead_run_start: Optional[int] = None
+    jump_run_start: Optional[int] = None
 
     #start stream alignment, more flushing of playback onto my own platform. 
-    try:
-        for frame_idx, _ in enumerate(mm.run(verbose=verbose_run), start=0):
-            if (
-                playback
-                and not playback_started
-                and mm.input_type == "audio"
-                and mm.performance_file is not None
-                and Path(mm.performance_file).exists()
-            ):
-                stop_event = threading.Event()
-                playback_thread = _start_playback(
-                    performance_path=Path(mm.performance_file),
-                    stop_event=stop_event,
-                )
-                playback_started = True
+    for frame_idx, _ in enumerate(mm.run(verbose=verbose_run), start=0):
+        if (
+            playback
+            and not playback_started
+            and mm.input_type == "audio"
+            and mm.performance_file is not None
+            and Path(mm.performance_file).exists()
+        ):
+            stop_event = threading.Event()
+            playback_thread = _start_playback(
+                performance_path=Path(mm.performance_file),
+                stop_event=stop_event,
+            )
+            playback_started = True
 
-            ref_idx, perf_idx = mm.score_follower._warping_path[-1]
-            dt_score = (
-                (ref_idx - prev_ref) / frame_rate if prev_ref is not None else np.nan
-            )
-            dt_perf = (
-                (perf_idx - prev_perf) / frame_rate if prev_perf is not None else np.nan
-            )
-            tempo_ratio = (
-                dt_perf / dt_score
-                if dt_score not in (None, 0) and not np.isnan(dt_score)
-                else np.nan
-            )
-            prev_ref = ref_idx
-            prev_perf = perf_idx
+        ref_idx, perf_idx = mm.score_follower._warping_path[-1]
+        delta_ref = ref_idx - prev_ref if prev_ref is not None else np.nan
+        delta_perf = perf_idx - prev_perf if prev_perf is not None else np.nan
+        dt_score = delta_ref / frame_rate if prev_ref is not None else np.nan
+        dt_perf = delta_perf / frame_rate if prev_perf is not None else np.nan
+        dt_score_val = dt_score
+        delta_ratio = np.nan
+        if not np.isnan(delta_ref) and delta_ref != 0:
+            delta_ratio = delta_perf / delta_ref
+        elif not np.isnan(delta_perf):
+            delta_ratio = delta_perf  # capture perf advance when score is clamped
+        tempo_ratio = delta_ratio if (not np.isnan(delta_ref) and delta_ref != 0) else np.nan
+        perf_leading = (delta_ref == 0 or np.isnan(delta_ref)) and (delta_perf is not None) and not np.isnan(delta_perf) and delta_perf > 0
 
-            rows.append(
-                {
-                    "frame": frame_idx,
-                    "ref_idx": ref_idx,
-                    "input_idx": perf_idx,
-                    "score_time": ref_idx / frame_rate,
-                    "perf_time": perf_idx / frame_rate,
-                    "tempo_ratio": tempo_ratio,
-                }
-            )
-            print(
-                f"[live] Frame {frame_idx:05d} | score_idx={ref_idx} | "
-                f"perf_idx={perf_idx} | tempo_ratio={_format_ratio(tempo_ratio)}",
-                flush=True,
-            )
-    finally:
-        if stop_event is not None:
-            stop_event.set()
-        if playback_thread is not None:
-            playback_thread.join(timeout=1)
+        #more debugging for performance
+        print(
+            f"Δref={delta_ref if not np.isnan(delta_ref) else 'nan'}, Δperf={delta_perf if not np.isnan(delta_perf) else 'nan'}, "
+            f"grad={_format_ratio(delta_ratio)}"
+        )
+
+        if osc:
+            osc.send_message("/warp", [
+                int(ref_idx),
+                int(perf_idx),
+                float(delta_ratio),
+                float(tempo_ratio) if not np.isnan(tempo_ratio) else np.nan,
+                float(dt_score_val),
+                float(delta_ref),
+                float(delta_perf),
+                int(perf_leading),
+            ])
+
+        # store per-frame score delta for debugging/analysis
+        prev_ref = ref_idx
+        prev_perf = perf_idx
+
+        rows.append(
+            {
+                "frame": frame_idx,
+                "ref_idx": ref_idx,
+                "input_idx": perf_idx,
+                "score_time": ref_idx / frame_rate,
+                "perf_time": perf_idx / frame_rate,
+                "dt_score": dt_score_val,
+                "delta_ref": delta_ref,
+                "delta_perf": delta_perf,
+                "delta_ratio": delta_ratio,
+                "tempo_ratio": tempo_ratio,
+                "perf_leading": perf_leading,
+            }
+        )
+        tr_display = _format_ratio(tempo_ratio if not np.isnan(tempo_ratio) else delta_ratio)
+        print(
+            f"[live] Frame {frame_idx:05d} | score_idx={ref_idx} | "
+            f"perf_idx={perf_idx} | t_r={_format_ratio(tempo_ratio)} | "
+            f"grad={_format_ratio(delta_ratio)} | dt_score={_format_ratio(dt_score_val)}",
+            flush=True,
+        )
+
+        # event logging as soon as runs close
+        lead_now = (delta_ref == 0 or np.isnan(delta_ref)) and (not np.isnan(delta_perf)) and delta_perf > 0
+        jump_now = (not np.isnan(delta_ref)) and delta_ref >= 5
+        if lead_now and lead_run_start is None:
+            lead_run_start = frame_idx
+        if not lead_now and lead_run_start is not None:
+            end = frame_idx - 1
+            length = end - lead_run_start + 1
+            print(f"[event] perf_leading run start={lead_run_start} end={end} len={length}", flush=True)
+            if osc:
+                osc.send_message("/event", ["perf_leading", lead_run_start, end, length])
+            lead_run_start = None
+
+        if jump_now and jump_run_start is None:
+            jump_run_start = frame_idx
+        if not jump_now and jump_run_start is not None:
+            end = frame_idx - 1
+            length = end - jump_run_start + 1
+            print(f"[event] score_jump run start={jump_run_start} end={end} len={length}", flush=True)
+            if osc:
+                osc.send_message("/event", ["score_jump", jump_run_start, end, length])
+            jump_run_start = None
+
+    if playback_thread is not None:
+        # Let playback finish naturally for live runs too
+        playback_thread.join()
+
+    # flush any open runs
+    if lead_run_start is not None:
+        end = frame_idx
+        length = end - lead_run_start + 1
+        print(f"[event] perf_leading run start={lead_run_start} end={end} len={length}", flush=True)
+        if osc:
+            osc.send_message("/event", ["perf_leading", lead_run_start, end, length])
+    if jump_run_start is not None:
+        end = frame_idx
+        length = end - jump_run_start + 1
+        print(f"[event] score_jump run start={jump_run_start} end={end} len={length}", flush=True)
+        if osc:
+            osc.send_message("/event", ["score_jump", jump_run_start, end, length])
 
     df = pd.DataFrame(rows)
     if df.empty:
         raise RuntimeError("Matchmaker run produced no frames; check input files.")
+    print(
+        "[live] Collected "
+        f"{len(df)} frames (max ref_idx={int(df['ref_idx'].max())}, "
+        f"max input_idx={int(df['input_idx'].max())})",
+        flush=True,
+    )
+    summarize_runs(df)
 
     if save_path:
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,13 +435,16 @@ def stream_live_run(
 #haven't ran a live test yet.... 
     eval_results = None
     if annotations:
-        eval_results = mm.run_evaluation(
-            perf_annotations=annotations,
-            debug=True,
-            save_dir=results_dir,
-            run_name=run_name,
-        )
-        print(f"[live] Evaluation summary:\n{json.dumps(eval_results, indent=2)}")
+        if mm.performance_file is None:
+            print("[live] Skipping evaluation/debug save because no performance file was provided.", flush=True)
+        else:
+            eval_results = mm.run_evaluation(
+                perf_annotations=annotations,
+                debug=True,
+                save_dir=results_dir,
+                run_name=run_name,
+            )
+            print(f"[live] Evaluation summary:\n{json.dumps(eval_results, indent=2)}")
 
     return df, eval_results
 
@@ -245,7 +486,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--performance-file",
         type=Path,
         default=DEFAULT_AUDIO_PERF,
-        help="audio or MIDI performance file, only when  --live is set.", #
+        help="audio or MIDI performance file, only when  --live is set. "
+        "Pass an empty string to use live input instead of a file.",
     )
     parser.add_argument(
         "--annotations",
@@ -315,15 +557,37 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable Matchmaker's internal progress bars/logs.",
     )
+    #TouchDesigner flags
+    parser.add_argument(
+        "--osc-host", default="127.0.0.1"
+    )
+    parser.add_argument(
+        "--osc-port", type=int, default=8000
+    )
+    parser.add_argument(
+        "--osc", action="store_true", 
+        help="Send OSC to TouchDesigner application– Clarify host and port in order to work"
+    )
+    
     parser.set_defaults(wait=True, playback=True)
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args()
+    #create TouchDesginer client
+    osc = SimpleUDPClient(args.osc_host, args.osc_port) if args.osc else None
+
 
     if not args.live:
-        df = stream_from_file(args.tsv, args.frame_rate)
+        df = stream_from_file(
+            tsv_path=args.tsv,
+            frame_rate=args.frame_rate,
+            playback=args.playback,
+            performance_path=args.performance_file,
+            wait=args.wait,
+            osc=osc,
+        )
         if args.save_path:
             args.save_path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(args.save_path, sep="\t", index=False)
@@ -333,15 +597,23 @@ def main() -> None:
     if annotations is None and DEFAULT_ANNOTS.exists():
         annotations = DEFAULT_ANNOTS
 
+    performance_file: Optional[Path] = (
+        args.performance_file
+        if args.performance_file
+        and str(args.performance_file) not in ("", ".")
+        else None
+    )
+
     mm = Matchmaker(
         score_file=args.score_file,
-        performance_file=args.performance_file,
+        performance_file=performance_file,
         wait=args.wait,
         input_type=args.input_type,
         method=args.method,
         frame_rate=args.frame_rate,
     )
-    #element that starts audio.... but there are still some
+    #element that starts audio upon loop init.... not reliable. 
+    #resolved^
     stream_live_run(
         mm=mm,
         frame_rate=args.frame_rate,
@@ -351,6 +623,7 @@ def main() -> None:
         results_dir=args.results_dir,
         verbose_run=not args.quiet,
         playback=args.playback,
+        osc=osc,
     )
 
 

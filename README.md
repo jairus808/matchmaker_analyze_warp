@@ -5,10 +5,9 @@ out all major components to implement an analysis layer that indicates and chara
 
 All work with this CPSC4900 will is done (for now) on analyze_warp.py. 
 
-## Future implementations:
-- Event characterization
-- Touchdesign compatbility
-
+## INCOMING COMMIT FOR ALL VIEWERS OF FINAL CPSC4900 SUBMISSION!
+- If you're reading this, chances are I submitted my github to the index.html.
+- I will be updating this soon
 
 
 

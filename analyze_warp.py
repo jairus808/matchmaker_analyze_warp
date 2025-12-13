@@ -12,9 +12,20 @@ import pandas as pd
 import pyaudio
 
 from matchmaker import Matchmaker
-from matchmaker.features.audio import SAMPLE_RATE
+#modules needed to import to access frame rate and hop length
+from matchmaker.dp import OnlineTimeWarpingArzt, OnlineTimeWarpingDixon
+from matchmaker.features.audio import (
+    ChromagramProcessor,
+    CQTProcessor,
+    LogSpectralEnergyProcessor,
+    MelSpectrogramProcessor,
+    MFCCProcessor,
+    SAMPLE_RATE,
+)
 #install python-osc
 from pythonosc.udp_client import SimpleUDPClient 
+from matchmaker.io.audio import AudioStream
+from matchmaker.prob.hmm import GaussianAudioPitchHMM, GaussianAudioPitchTempoHMM
 
 
 os.environ["PARTITURA_SOUNDFONT"] = "tests/Steinway_B_soundfont.sf2"
@@ -208,7 +219,7 @@ def stream_from_file(
                 time.sleep(1 / frame_rate)
     finally:
         if playback_thread is not None:
-            # Let playback finish naturally; join so the audio completes.
+            # Let playback finish naturally; join so the audio completes
             playback_thread.join()
 
     # flush any open runs
@@ -271,10 +282,10 @@ def _start_playback(performance_path: Path, stop_event: threading.Event) -> thre
     return thread
 
 
-def describe_tempo_events(df: pd.DataFrame) -> List[dict]:
-    # Placeholder: not currently used in the CLI flow.
-    # Returns an empty list to keep the module runnable until the logic is defined.
-    return []
+# def describe_tempo_events(df: pd.DataFrame) -> List[dict]:
+#     # Placeholder: not currently used in the CLI
+#     # Returns an empty list to keep 
+#     return [] 
 
 
 
@@ -302,7 +313,7 @@ def stream_live_run(
     lead_run_start: Optional[int] = None
     jump_run_start: Optional[int] = None
 
-    #start stream alignment, more flushing of playback onto my own platform. 
+    #start stream alignment, flushing of playback mechanism onto my own platform. 
     for frame_idx, _ in enumerate(mm.run(verbose=verbose_run), start=0):
         if (
             playback
@@ -573,6 +584,74 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _reset_audio_hop(mm: Matchmaker, frame_rate: int) -> None:
+    """Rebuild audio pipeline to honor a custom frame rate without touching core code."""
+    hop_length = max(1, int(round(SAMPLE_RATE / frame_rate)))
+    proc_cls = type(mm.processor)
+    if proc_cls not in {
+        ChromagramProcessor,
+        MFCCProcessor,
+        CQTProcessor,
+        MelSpectrogramProcessor,
+        LogSpectralEnergyProcessor,
+    }:
+        print("[warn] Custom frame_rate ignored: unsupported processor type for audio hop override.")
+        return
+
+    # Recreate processor and stream with new hop
+    new_proc = proc_cls(sample_rate=SAMPLE_RATE, hop_length=hop_length)
+    prev_stream = mm.stream
+    performance_file = Path(mm.performance_file) if mm.performance_file else None
+    new_stream = AudioStream(
+        processor=new_proc,
+        file_path=str(performance_file) if performance_file else None,
+        wait=getattr(prev_stream, "wait", True),
+        target_sr=SAMPLE_RATE,
+        hop_length=hop_length,
+        sample_rate=SAMPLE_RATE,
+        queue=getattr(prev_stream, "queue", None),
+        device_name_or_index=getattr(mm, "device_name_or_index", None),
+    )
+
+    # Recompute reference features at the new hop
+    mm.processor = new_proc
+    mm.stream = new_stream
+    mm.frame_rate = frame_rate
+    mm.reference_features = mm.processor(mm.score_audio)
+
+    # Recreate score follower with the new reference and queue
+    sf = mm.score_follower
+    if isinstance(sf, OnlineTimeWarpingArzt):
+        dist = getattr(sf, "distance_func", OnlineTimeWarpingArzt.DEFAULT_DISTANCE_FUNC)
+        mm.score_follower = OnlineTimeWarpingArzt(
+            reference_features=mm.reference_features,
+            queue=mm.stream.queue,
+            distance_func=dist,
+            frame_rate=frame_rate,
+        )
+    elif isinstance(sf, OnlineTimeWarpingDixon):
+        dist = getattr(sf, "distance_func", OnlineTimeWarpingDixon.DEFAULT_DISTANCE_FUNC)
+        mm.score_follower = OnlineTimeWarpingDixon(
+            reference_features=mm.reference_features,
+            queue=mm.stream.queue,
+            distance_func=dist,
+            frame_rate=frame_rate,
+        )
+    elif isinstance(sf, GaussianAudioPitchTempoHMM):
+        mm.score_follower = GaussianAudioPitchTempoHMM(
+            reference_features=mm.reference_features,
+            queue=mm.stream.queue,
+            transition_scale=getattr(sf, "transition_scale", 0.05),
+        )
+    elif isinstance(sf, GaussianAudioPitchHMM):
+        mm.score_follower = GaussianAudioPitchHMM(
+            reference_features=mm.reference_features,
+            queue=mm.stream.queue,
+        )
+    else:
+        print("[warn] Custom frame_rate applied to features/stream, but score_follower type not handled.")
+
+
 def main() -> None:
     args = parse_args()
     #create TouchDesginer client
@@ -612,6 +691,9 @@ def main() -> None:
         method=args.method,
         frame_rate=args.frame_rate,
     )
+    # Optional audio hop override using CLI frame_rate without touching core Matchmaker code
+    if args.input_type == "audio":
+        _reset_audio_hop(mm, args.frame_rate)
     #element that starts audio upon loop init.... not reliable. 
     #resolved^
     stream_live_run(

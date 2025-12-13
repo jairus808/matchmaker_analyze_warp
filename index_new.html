@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CS 4900 Thesis – Jairus Rhoades</title>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      background: linear-gradient(rgba(255,255,255,0.82), rgba(255,255,255,0.82)),
+                  url("background_screenshot_for_Webpage_490.png") center center / cover fixed no-repeat;
+      color: #222;
+      line-height: 1.55;
+    }
+
+    .wrapper {
+      max-width: 750px;
+      padding: 40px 20px 80px;
+      margin: auto;
+    }
+
+    h1 {
+      font-weight: 300;
+      font-size: 2.4rem;
+      margin-bottom: 0.5rem;
+      letter-spacing: 0.5px;
+    }
+
+    .subtitle {
+      margin-top: 0;
+      margin-bottom: 2rem;
+      font-size: 1.05rem;
+      color: #555;
+    }
+
+    h2 {
+      font-weight: 300;
+      margin-top: 3rem;
+      border-top: 1px solid #ddd;
+      padding-top: 1.5rem;
+      letter-spacing: 0.5px;
+    }
+
+    a {
+      color: #00356b; /* Yale blue adjacent */
+      text-decoration: none;
+      border-bottom: 1px solid rgba(0,53,107,0.25);
+      transition: 0.2s ease;
+    }
+
+    a:hover {
+      color: #001d3d;
+      border-bottom-color: rgba(0,53,107,0.5);
+    }
+
+    .file-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .file-list li {
+      margin: 0.5rem 0;
+    }
+
+    .abstract {
+      background: white;
+      border: 1px solid #e5e5e5;
+      padding: 25px 28px;
+      border-radius: 6px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrapper">
+    <h1>Thesis Abstract</h1>
+    <p class="subtitle">CPSC 4900 · Jairus Rhoades</p>
+
+    <div class="abstract">
+      <p>
+        <code>analyze_warp.py</code> is used to examine the real-time alignment output of the
+        previously implemented Matchmaker score-following library and to expose internal
+        per-frame metrics in an approach for visualization through a TouchDesigner project.
+        The script extracts per-frame metrics including changes in score and performance
+        indices, estimated tempo ratios, and event markers for clamping and score jumps.
+        These outputs are examined across different sampling and hop-length configurations
+        to document how Matchmaker advances, freezes, and re-anchors during alignment.
+        An OSC interface transmits the per-frame stream to TouchDesigner, where the metrics
+        drive a generative visualization. The resulting system illustrates the characteristic
+        behaviors of Matchmaker’s alignment process in real time, including sensitivity to
+        frame-rate settings, intermittent periods of clamping, and sudden re-anchoring events.
+        Smoothing and simple hysteresis methods are applied within TouchDesigner to stabilize
+        rapidly changing signals for visual use. The work provides a technical account of how
+        the alignment metrics behave when surfaced directly to an external visualization
+        environment.
+      </p>
+    </div>
+
+    <h2>Downloads</h2>
+    <ul class="file-list">
+      <li><a href="Rhoades_Jairus_Poster_CS490.pdf">Thesis Poster (PDF)</a></li>
+      <li><a href="Jairus_Rhoades_4900_Final_Report_Submit.pdf">Final Report (PDF)</a></li>
+      <li><a href="CPSC4900_VERYIMPORTANTFILE.toe">TouchDesigner Project (.toe)</a></li>
+      <li><a href="analyze_warp.py">analyze_warp.py (Python Script)</a></li>
+      <li><a href="https://github.com/jairusrhoades/matchmaker">GitHub Repository (code state as of Dec. 11, 2025)</a></li>
+    </ul>
+  </div>
+</body>
+</html>

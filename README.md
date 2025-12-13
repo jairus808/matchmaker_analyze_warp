@@ -1,13 +1,15 @@
-# Analyze_warp
+# Analyze_warp.py, a senior thesis project for a Computing and the Arts (CPAR) project @ Yale College
 
 As a part of my CPSC4900, I will build on top of the existing Matchmaker library, flushing 
-out all major components to implement an analysis layer that indicates and characterizes expressive timing events. Using a livetime comparison of ref_idx and perf_idx to deliver tempo_ratio, an indication of alignment performance features against expected performnace features encoded in the input score. 
+out most major components related to matchmakers run engine (tested only using arzt method)   to implement an analysis layer that indicates and characterizes expressive timing events. Using a livetime comparison of ref_idx and perf_idx to deliver tempo_ratio, delta_ratio, and other metrics of deviation, an indication of alignment performance features against expected performnace features encoded in the input score. All metrics gathered are sent in a simple osc message used in touchdesigner. The current state of my touchdesigner project can be viewed as it is within this directory submitted for review.
 
-All work with this CPSC4900 will is done (for now) on analyze_warp.py. 
+ 
+ Analyze_warp.py builds upon the Park, et al.'s working version (v0.2.1) of matchmaker. Additional files on this branch include testing .mp3s, .wavs, .musicxml's uploaded by myself (and not the canonical (n)ASAP database that most of the testing files come from).
 
-## INCOMING COMMIT FOR ALL VIEWERS OF FINAL CPSC4900 SUBMISSION!
-- If you're reading this, chances are I submitted my github to the index.html.
-- I will be updating this soon
+
+Expressed gratitude to Park, et al.'s contributions to the fields of score alignment– without matchmaker and the accessibility that it brings to score alignment systems, this senior project likely would not have happened. 
+
+
 
 
 
